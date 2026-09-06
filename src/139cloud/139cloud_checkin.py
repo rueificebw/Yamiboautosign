@@ -221,10 +221,16 @@ class SignInService:
     # .thumbcache cookie 的 hash (由 fp.min.js 指纹脚本生成, 同一设备固定)
     THUMBCACHE_HASH = "45700955f71be4ef518b0a1af26a3f40"
 
-    def __init__(self, auth: CaiYunAuth, client_type: str = "app", device_id: Optional[str] = None):
+    def __init__(self, auth: CaiYunAuth, client_type: str = "app", device_id: Optional[str] = None,
+                 fingerprint: Optional[Dict[str, str]] = None):
         self.auth = auth
         self.client_type = client_type
-        self.device_id = device_id or self._generate_device_id()
+        fp = fingerprint or {}
+        # 优先使用抓包得到的真实设备指纹(领取云朵的风控必需), 缺失时才回退到随机生成
+        self.device_id = device_id or fp.get("device_id") or self._generate_device_id()
+        self._smid = fp.get("smid") or ""
+        self._thumbcache = fp.get("thumbcache") or ""
+        self._c_wbkfro = fp.get("c_wbkfro") or ""
         self._init_market_cookies()
 
     def _generate_device_id(self) -> str:
@@ -234,14 +240,21 @@ class SignInService:
         return "B" + b64.b64encode(raw).decode()[:86] + "=="
 
     def _init_market_cookies(self):
-        """在 m.mcloud.139.com 域上设置 .thumbcache/smidV2/userDomainId cookie (领取必需)"""
+        """在 m.mcloud.139.com 域上设置 .thumbcache/smidV2/_c_WBKFRo/userDomainId cookie
+        领取云朵会触发风控, 必须使用抓包得到的真实设备指纹, 否则返回“活动太火爆啦，锁定失败”。"""
         s = self.auth.session
-        # .thumbcache 值 = deviceId 去掉首字符 "B"
-        thumb_val = self.device_id[1:] if self.device_id.startswith("B") else self.device_id
+        # .thumbcache 值 = deviceId 去掉首字符 "B" (优先用抓包真实值)
+        thumb_val = self._thumbcache or (
+            self.device_id[1:] if self.device_id.startswith("B") else self.device_id
+        )
         s.cookies.set(f".thumbcache_{self.THUMBCACHE_HASH}", thumb_val,
                        domain="m.mcloud.139.com", path="/")
-        s.cookies.set("smidV2", uuid.uuid4().hex + uuid.uuid4().hex[:16],
-                       domain="m.mcloud.139.com", path="/")
+        # smidV2: 指纹 SDK 生成(格式为 时间戳+hash), 优先用抓包真实值
+        smid_val = self._smid or (uuid.uuid4().hex + uuid.uuid4().hex[:16])
+        s.cookies.set("smidV2", smid_val, domain="m.mcloud.139.com", path="/")
+        # _c_WBKFRo: 风控 cookie, 抓包中存在时透传
+        if self._c_wbkfro:
+            s.cookies.set("_c_WBKFRo", self._c_wbkfro, domain="m.mcloud.139.com", path="/")
         # userDomainId 从 JWT payload 提取
         if self.auth.jwt_token:
             import base64 as b64, json as _json
@@ -426,13 +439,48 @@ class SignInService:
             self._post_journaling(keyword)
             self._sleep(0.3, 0.5)
 
-    def _claim_all_clouds(self) -> Optional[dict]:
-        """通过 /market/ 路径领取全部待领云朵(无需cloudId, 绕过单条锁定)"""
-        url = f"{self.BASE_URL}/market/signin/page/receiveV2?client={self.client_type}"
-        resp = self._request("GET", url, headers={"showLoading": "true"})
-        if not resp:
-            return None
-        return resp.json()
+    def _receive_warmup(self) -> Tuple[list, int]:
+        """领取前的会话预热序列(严格对照 ProxyPin 抓包中真实 App 的顺序):
+            infoV3 -> taskListV3 -> getPopInfo -> popup -> journaling(newsignin_index_receive_type)
+        缺少 getPopInfo/popup 会导致服务端返回“活动太火爆啦，锁定失败”。
+        返回 (receiveList, toReceive)。
+        """
+        info_url = f"{self.BASE_URL}/ycloud/signin/page/infoV3?client={self.client_type}"
+        receive_list: list = []
+        to_receive = 0
+        info_resp = self._request("GET", info_url)
+        if info_resp:
+            info_data = info_resp.json()
+            if info_data.get("code") == 0:
+                r = info_data.get("result", {})
+                receive_list = r.get("receiveList", []) or []
+                to_receive = r.get("toReceive", 0)
+        self._sleep(0.3, 0.6)
+
+        # taskListV3
+        self._request(
+            "POST", f"{self.BASE_URL}/ycloud/signin/task/taskListV3",
+            json={"marketname": "sign_in_3", "clientVersion": "13.1.1"},
+        )
+        self._sleep(0.3, 0.6)
+
+        # getPopInfo
+        self._request(
+            "POST", f"{self.BASE_URL}/ycloud/signin/public/getPopInfo",
+            json={"clientType": "android", "version": "13.1.1"},
+            headers={"Content-Type": "application/json;charset=UTF-8"},
+        )
+        self._sleep(0.3, 0.6)
+
+        # popup
+        self._request("GET", f"{self.BASE_URL}/ycloud/signin/page/popup")
+        self._sleep(0.3, 0.6)
+
+        # journaling: 领取动作埋点(receive_type)
+        self._post_journaling("newsignin_index_receive_type")
+        self._sleep(0.3, 0.5)
+
+        return receive_list, to_receive
 
     def _claim_cloud(self, cloud_id: int) -> bool:
         """通过 /ycloud/ 路径领取指定云朵(fallback)"""
@@ -450,79 +498,41 @@ class SignInService:
 
     def receive(self):
         log_title("云朵汇总")
-        # 流程: journaling埋点 → infoV3 → /market/receiveV2(无cloudId) → fallback /ycloud/ → cloudRecordV2
+        # 页面级埋点(模拟 App 进入签到页)
         self._prepare_receive_session()
         self._sleep()
 
         claimed = 0
+        consecutive_fail = 0
         info_url = f"{self.BASE_URL}/ycloud/signin/page/infoV3?client={self.client_type}"
-        info_resp = self._request("GET", info_url)
-        pending_amount = 0
-        if info_resp:
-            info_data = info_resp.json()
-            if info_data.get("code") == 0:
-                pending_amount = info_data.get("result", {}).get("toReceive", 0)
 
-        # 方式1: /market/ 路径一次性领取全部(推荐, 无需cloudId)
-        if pending_amount > 0:
-            log_info(f"待领取云朵: {pending_amount}，尝试领取...")
-            result = self._claim_all_clouds()
-            if result and result.get("code") == 0:
-                r = result.get("result", {})
-                log_success(f"领取云朵成功，本次+{r.get('receive', '?')}，当前总云朵: {r.get('total', '?')}")
+        # 严格对照抓包: 每领取一笔前都要走一遍预热序列(infoV3→taskListV3→getPopInfo→popup→journaling)
+        # 以获取服务端“锁定”，随后 GET /ycloud/signin/page/receiveV2?client=app&cloudId={recordId}
+        MAX_ROUNDS = 40
+        for _ in range(MAX_ROUNDS):
+            receive_list, to_receive = self._receive_warmup()
+            if not receive_list:
+                if to_receive > 0:
+                    log_warn(f"待领取 {to_receive} 云朵，但 receiveList 为空，跳过")
+                break
+
+            item = receive_list[0]
+            rid = item.get("recordId")
+            num = item.get("cloudNum", 0)
+            if not rid:
+                break
+
+            log_info(f"领取云朵 +{num} (待领取 {to_receive})")
+            if self._claim_cloud(rid):
                 claimed += 1
-            elif result:
-                log_warn(f"/market/ 领取失败: {result.get('msg', '未知')}，尝试逐条领取...")
-
-        # 方式2: 逐条领取 fallback (/ycloud/ 路径 + cloudId)
-        if claimed == 0:
-            for attempt in range(2):
-                info_resp = self._request("GET", info_url)
-                if not info_resp:
-                    continue
-                info_data = info_resp.json()
-                if info_data.get("code") != 0:
-                    continue
-                receive_list = info_data.get("result", {}).get("receiveList", [])
-                if not receive_list:
+                consecutive_fail = 0
+            else:
+                consecutive_fail += 1
+                # 连续两次锁定失败则停止，避免无意义重试
+                if consecutive_fail >= 2:
+                    log_warn("连续领取失败(锁定失败)，停止本轮领取")
                     break
-
-                for item in receive_list:
-                    rid = item.get("recordId")
-                    num = item.get("cloudNum", 0)
-                    if not rid:
-                        continue
-                    log_info(f"领取云朵 +{num}")
-                    if self._claim_cloud(rid):
-                        claimed += 1
-                    self._sleep()
-
-                self._sleep()
-                if attempt == 0 and receive_list:
-                    self._prepare_receive_session()
-                    self._sleep()
-
-        # 方式3: cloudRecordV2 fallback
-        if claimed == 0:
-            for page in [1, 2]:
-                record_url = (f"{self.BASE_URL}/ycloud/signin/public/cloudRecordV2"
-                              f"?aiDou=0&type=0&pageNumber={page}&pageSize=100")
-                record_resp = self._request("GET", record_url)
-                if not record_resp:
-                    continue
-                record_data = record_resp.json()
-                if record_data.get("code") != 0:
-                    continue
-                records = record_data.get("result", {}).get("records", [])
-                for rec in records:
-                    rid = rec.get("id", -1)
-                    if rec.get("receiveStatus") == 0 and rid != -1:
-                        log_info(f"领取: {rec.get('summary', '未知')} (+{rec.get('num', 0)}云朵)")
-                        if self._claim_cloud(rid):
-                            claimed += 1
-                        self._sleep()
-                if page >= record_data.get("result", {}).get("pages", 0):
-                    break
+            self._sleep(0.8, 1.5)
 
         # 最终汇总
         info_resp = self._request("GET", info_url)
@@ -615,7 +625,13 @@ def run_with_auth(auth_path: str):
         log_error("认证失败，请重新获取最新 Authorization")
         return
 
-    service = SignInService(auth, client_type="app", device_id=config.get("device_id", ""))
+    fingerprint = {
+        "device_id": config.get("device_id", "").strip(),
+        "smid": config.get("smid", "").strip(),
+        "thumbcache": config.get("thumbcache", "").strip(),
+        "c_wbkfro": config.get("c_wbkfro", "").strip(),
+    }
+    service = SignInService(auth, client_type="app", fingerprint=fingerprint)
 
     service.signin_status()
     service.open_send()
